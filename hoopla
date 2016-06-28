@@ -1,0 +1,648 @@
+#!/usr/bin/env python
+#
+# Hoopla REST API wrapper for Python.
+# (c) 2016 Hoopla Software, Inc.
+# Licensed under the MIT License, https://opensource.org/licenses/MIT
+"""
+Implements wrapper objects for Hoopla's REST API, and provides a
+command line interface to the wrapper objects.
+"""
+
+from argparse import ArgumentParser
+import os
+import json
+from oauthlib.oauth2 import BackendApplicationClient
+from requests.exceptions import HTTPError
+from requests_oauthlib import OAuth2Session
+
+SERVER = 'api.hoopla.net'
+
+class Base(object):
+    """Common functionality for object wrappers around the Hoopla API."""
+
+    def __init__(self, api_attrs, client, obj_attrs=None):
+        """Initializes the wrapper object.
+
+        api_attrs -- dict containing a resource's data
+        client -- reference to the requests client object
+        obj_attrs -- dict containing additional attributes
+            for the python object
+        """
+
+        self.client = client
+        self._assign_api_attrs(api_attrs)
+
+        if obj_attrs:
+            self.__dict__.update(obj_attrs)
+
+    def _assign_api_attrs(self, api_attrs):
+        # assign API attribute dict to internal reference
+
+        self.api_attrs = api_attrs.copy() if api_attrs else {}
+
+        # Use special treatment for 'links' key, and transorm it
+        # to a new dict with keys from 'rel' values and values
+        # from 'href' values. This enables resource URLs to be
+        # referenced from reldict instead of a less convenient list.
+        if 'links' in self.api_attrs:
+            self.reldict = {}
+            for item in self.api_attrs['links']:
+                self.reldict[item['rel']] = item['href']
+
+    def __setattr__(self, name, value):
+        # Enables API attributes to be dot-referenced in python code.
+        # API attributes take precedence over object attributes.
+        if name in self._api_attr_names():
+            if name == 'owner':
+                if isinstance(value, User):
+                    value = {'kind': 'user', 'href': value.href}
+            self.api_attrs[name] = value
+        else:
+            self.__dict__[name] = value
+
+    def __getattr__(self, name):
+        # Enables API attributes to be dot-referenced in python code.
+        # API attributes take precedence over object attributes.
+        if name in self._api_attr_names():
+            try:
+                return self.api_attrs[name]
+            except KeyError:
+                return None
+        else:
+            return self.__dict__[name]
+
+    def json(self):
+        """Return JSON representing the wrapper object."""
+        return json.dumps(self.api_attrs)
+
+    def _collection(self, klass, rel, params=None, obj_attrs=None):
+        # Returns a collection of objects of the specified klass,
+        # using the specified rel from the API's links attribute.
+        # params is converted to query parameters in the request.
+        # obj_attrs may be used to provide additional attributes
+        # for the objects that will be created.
+        res = self.client.get(self.reldict[rel], params=params)
+        self.raise_if_failed(res)
+
+        lst = []
+        for api_attrs in res.json():
+            lst.append(klass(api_attrs, self.client, obj_attrs=obj_attrs))
+        return lst
+
+    def reload(self):
+        """
+        Update object state from the server. Will raise an
+        HTTPError if the request fails.
+        """
+
+        res = self.client.get(self.api_attrs['href'])
+        self.raise_if_failed(res)
+        self._assign_api_attrs(res.json())
+
+    def save(self):
+        """
+        Save object state to the server. Will raise an
+        HTTPError if the request fails.
+        """
+
+        headers = {'Content-Type': self._media_type() + '+json'}
+        res = None
+        if self.href:
+            # has 'href', so this is an update
+            res = self.client.put(self.href, headers=headers, data=self.json())
+        else:
+            # has no 'href', so resource must be created
+            res = self.client.post(self._create_url, headers=headers,
+                                   data=self.json())
+        self.raise_if_failed(res)
+
+    def delete(self):
+        """
+        Delete's an object's representation on the server. Will raise an
+        HTTPError if the request fails.
+        """
+
+        res = self.client.delete(self.href)
+        self.raise_if_failed(res)
+
+    def raise_if_failed(self, response):
+        """Raises HTTPError if response.code is not OK."""
+        source = None
+        if 400 <= response.status_code < 500:
+            source = 'client'
+        elif response.status_code >= 500:
+            source = 'server'
+        if source:
+            raise HTTPError("{0} {1} error: {2} for url: {3}\n{4}".format(
+                response.status_code, source, response.reason,
+                response.url, response.text), response=response)
+
+    def _api_attr_names(self):
+        # return an array of top-level API attribute names
+        raise Exception("Subclasses must override _api_attr_names()!")
+
+    def _media_type(self):
+        # return the API media type for the object's representation
+        raise Exception("Subclasses must override _media_type()!")
+
+class Metric(Base):
+    """
+    Encapsulates attributes describing a numeric value being
+    measured in Hoopla.
+    """
+
+    def create_metric_value(self):
+        """Create a Metric Value object."""
+        return MetricValue(
+            None,
+            self.client,
+            obj_attrs={'_create_url': self.reldict['create_metric_value']})
+
+    def values(self, owner=None):
+        """Return a list of Metric Value objects."""
+        params = {'owner.href': owner.href} if owner else None
+        return self._collection(MetricValue, 'list_metric_values',
+                                params=params,
+                                obj_attrs={
+                                    '_rounded_to': self.format_rounded_to
+                                })
+
+    def _api_attr_names(self):
+        return ['href', 'name', 'type', 'format_rounded_to', 'links']
+
+    def __str__(self):
+        return self.name
+
+class MetricValue(Base):
+    """
+    Encapsulates attributes describing a numeric value belonging to a user.
+    """
+
+    def _api_attr_names(self):
+        return ['href', 'metric', 'owner', 'value', 'updated_at']
+
+    def _media_type(self):
+        return 'application/vnd.hoopla.metric-value'
+
+    def __getattr__(self, name):
+        # return a User object if asked for the owner attribute
+        if name == 'owner':
+            ownerdict = self.api_attrs['owner']
+            if ownerdict['kind'] == 'user':
+                owner = User({'href': ownerdict['href']}, self.client)
+                owner.reload()
+            return owner
+        else:
+            return super(MetricValue, self).__getattr__(name)
+
+    def __str__(self):
+        return "{0} {1:.{2}f}".format(self.owner, self.value,
+                                      self._rounded_to)
+
+class User(Base):
+    """Encapsulates attributes describing a user of Hoopla."""
+
+    def _api_attr_names(self):
+        return ['href', 'first_name', 'last_name', 'email']
+
+    def __str__(self):
+        return("{0} {1} <{2}>".format(self.first_name, self.last_name,
+                                      self.email))
+
+class Newsflash(Base):
+    """Definition of a newsworthy event in Hoopla."""
+
+    def _api_attr_names(self):
+        return ['href', 'name', 'creator', 'icon_src', 'links']
+
+    def _media_type(self):
+        return 'application/vnd.hoopla.newsflash'
+
+    def create_newsflash_event(self):
+        """Create a Newsflash Event object."""
+        return NewsflashEvent(
+            None,
+            self.client,
+            obj_attrs={'_create_url': self.reldict['create_newsflash_event']})
+
+    def __str__(self):
+        return self.name
+
+class NewsflashEvent(Base):
+    """A newsworthy event in Hoopla."""
+
+    def _api_attr_names(self):
+        return ['href', 'newsflash', 'title', 'message', 'owner', 'recipients']
+
+    def _media_type(self):
+        return 'application/vnd.hoopla.newsflash-event'
+
+    def __setattr__(self, name, value):
+        if name == 'recipients':
+            self.api_attrs[name] = []
+            for item in value:
+                if isinstance(item, User):
+                    value = {'kind': 'user', 'href': item.href}
+                    self.api_attrs[name].append(value)
+        else:
+            super(NewsflashEvent, self).__setattr__(name, value)
+
+class Connection(Base):
+    """Connection to the Hoopla service."""
+
+    def __init__(self, client_id, client_secret, server=SERVER):
+        """
+        Initialize the connection.
+
+        client_id -- obtained from the Hoopla Configuration Settings page
+        client_secret -- obtained from the Hoopla Configuration Settings page
+        server -- server for HTTP connection, default "api.hoopla.net"
+        """
+
+        # URLs to authenticate and get API Descriptor
+        api_root_url = 'https://' + server
+        token_url = api_root_url + '/oauth2/token'
+
+        # authenticate and obtain access_token
+        client_for_token = BackendApplicationClient(client_id=client_id)
+        oauth = OAuth2Session(client=client_for_token)
+        token = oauth.fetch_token(token_url=token_url,
+                                  client_id=client_id,
+                                  client_secret=client_secret)
+
+        # let Base initializer do its thing
+        super(Connection, self).__init__(
+            None, OAuth2Session(client_id, token=token), None)
+
+        # setup from API Descriptor
+        self.href = api_root_url
+        self.reload()
+
+    def _api_attr_names(self):
+        return ['href', 'links']
+
+    def users(self, email=None):
+        """Return a list of User objects."""
+        params = {'email': email} if email else None
+        return self._collection(User, 'list_users', params)
+
+    def metrics(self):
+        """Return a list of Metric objects."""
+        return self._collection(Metric, 'list_metrics')
+
+    def newsflashes(self):
+        """Return a list of Newsflash objects."""
+        return self._collection(Newsflash, 'list_newsflashes')
+
+    def create_newsflash(self):
+        """Create a Newsflash object."""
+        return Newsflash(
+            None, self.client,
+            obj_attrs={'_create_url': self.reldict['create_newsflash']})
+
+def main():
+    """Function for using module as a command line."""
+
+    conn = None
+
+    ###################################################################
+    # Helper functions
+    ###################################################################
+
+    def find_metric(name):
+        """Returns a Metric object by name."""
+
+        metrics = conn.metrics()
+        metric = next((m for m in metrics if m.name == name), None)
+        if not metric:
+            raise SystemExit(
+                'No metric found in Hoopla with name "{0}".'.format(name))
+        return metric
+
+    def metric_values(name):
+        """Returns a list of metric value objects for metric name."""
+
+        metric = find_metric(name)
+        return metric.values()
+
+    def collection(args):
+        """Helper function listing different object types."""
+
+        method = {
+            'users': conn.users,
+            'metrics': conn.metrics,
+            'values': lambda: metric_values(args.name[0]),
+            'newsflashes': conn.newsflashes
+        }.get(args.collection)
+        for entity in method():
+            print entity
+
+    def users_by_emails(emails):
+        """Returns a list of user objects matching supplied email addresses."""
+        results = []
+        for email in emails:
+            # get User object
+            users = conn.users(email)
+            if len(users) < 1:
+                raise SystemExit(
+                    'No user found in Hoopla with email "{0}".'.format(email))
+            else:
+                results.append(users[0])
+        return results
+
+    def create_value(args):
+        """Create a Metric Value on the server."""
+
+        # get User object
+        users = users_by_emails(args.email)
+
+        # get Metric object
+        metric = find_metric(args.metric[0])
+
+        # get new Metric Value instance using Metric factory method
+        metric_value = metric.create_metric_value()
+
+        # assign attributes required for new resource
+        metric_value.value = args.value[0]
+        metric_value.owner = users[0]
+
+        # save the new value on the service
+        metric_value.save()
+
+    def find_value(args):
+        """Find a Metric Value on the server."""
+
+        # get User object
+        users = users_by_emails(args.email)
+
+        # get Metric object
+        metric = find_metric(args.metric[0])
+
+        # find Metric Value matching supplied metric and owner
+        metric_values = metric.values(users[0])
+        if len(metric_values) < 1:
+            raise SystemExit(
+                'No metric found in Hoopla with name of "{0}"'
+                ' and email "{1}".'.format(metric.name, users[0].email))
+
+        return metric_values[0]
+
+    def update_value(args):
+        """Update a Metric Value on the server."""
+
+        metric_value = find_value(args)
+
+        # assign attributes required for new resource
+        metric_value.value = args.value[0]
+
+        # save the new value on the service
+        metric_value.save()
+
+    def create_newsflash(args):
+        """Create a Newsflash definition on the server."""
+
+        # get new Newsflash instance using Connection factory method
+        newsflash = conn.create_newsflash()
+
+        # assign attributes required for new resource
+        newsflash.name = args.name[0]
+        if args.creator:
+            newsflash.creator = args.creator[0]
+        newsflash.icon_src = args.icon_url[0]
+
+        # save the new value on the service
+        newsflash.save()
+
+    def find_newsflash(name):
+        """Find a Newsflash definition on the server."""
+
+        newsflashes = conn.newsflashes()
+        newsflash = \
+            next((n for n in newsflashes if n.name == name), None)
+        if not newsflash:
+            raise SystemExit(
+                'No Newsflash found in Hoopla with name "{0}".'.format(name))
+        return newsflash
+
+    def update_newsflash(args):
+        """Update a Newsflash definition on the server."""
+
+        # get Newsflash object
+        newsflash = find_newsflash(args.current_name[0])
+
+        # assign updated attributes of resource
+        if args.name:
+            newsflash.name = args.name[0]
+        if args.creator:
+            newsflash.creator = args.creator[0]
+        if args.icon_url:
+            newsflash.icon_src = args.icon_url[0]
+
+        # update the resource on the service
+        newsflash.save()
+
+    def delete_newsflash(args):
+        """Delete a Newsflash definition on the server."""
+
+        # get Newsflash object
+        newsflash = find_newsflash(args.name[0])
+
+        # delete on the service
+        newsflash.delete()
+
+    def delete_value(args):
+        """Delete a Metric Value on the server."""
+        metric_value = find_value(args)
+
+        metric_value.delete()
+
+    def create_event(args):
+        """Create a Newsflash Event on the server."""
+
+        # get Newsflash object
+        newsflash = find_newsflash(args.newsflash[0])
+
+        # get new Newsflash Event instance using Newsflash factory method
+        newsflash_event = newsflash.create_newsflash_event()
+
+        # assign attributes required for new resource
+        newsflash_event.title = args.title[0]
+        newsflash_event.message = args.message[0]
+
+        # handle optional owner
+        if args.email:
+            # get User object
+            users = users_by_emails(args.email)
+            newsflash_event.owner = users[0]
+
+        # handle optional recipients
+        if args.recipients:
+            # get User objects
+            users = users_by_emails(args.recipients)
+            newsflash_event.recipients = users
+
+        # save the new value on the service
+        newsflash_event.save()
+
+
+    ###################################################################
+    # Define and parse arguments
+    ###################################################################
+
+    # start with top-level parser
+    parser = \
+        ArgumentParser(description='command line interface to the Hoopla API')
+
+    parser.add_argument('-s', '--server', dest='server', type=str,
+                        nargs='?', default=SERVER, help='')
+
+    # command subparsers
+    subparsers = parser.add_subparsers(
+        title='commands for interacting with server resources',
+        description='(run `%(prog)s [COMMAND] -h` for more info'
+        ' on each command)')
+    list_parser = subparsers.add_parser(
+        'list', help='display contents of a collection')
+    create_parser = subparsers.add_parser(
+        'create', help='create a new resource')
+    create_subparsers = create_parser.add_subparsers(
+        title='resource types to create')
+    update_parser = subparsers.add_parser(
+        'update', help='update an existing resource')
+    update_subparsers = update_parser.add_subparsers(
+        title='resource types to update')
+    delete_parser = subparsers.add_parser(
+        'delete', help='delete an existing resource')
+    delete_subparsers = delete_parser.add_subparsers(
+        title='resource types to delete')
+
+    # "list COLLECTION" subcommand
+    list_parser.add_argument(
+        'collection', choices=['users', 'metrics', 'values', 'newsflashes'],
+        help='display users, metrics, values,' 'or newsflashes')
+    list_parser.add_argument('-n', '--name', type=str, nargs=1,
+                             help='name of metric, required for "list values"')
+    list_parser.set_defaults(func=collection)
+
+    # "create value" subcommand
+    create_value_parser = create_subparsers.add_parser(
+        'value', help='create a metric value')
+    create_value_parser.add_argument(
+        '-e', '--email', type=str, required=True, nargs=1,
+        help='email address of a user')
+    create_value_parser.add_argument(
+        '-m', '--metric', type=str, required=True, nargs=1,
+        help='name of a metric')
+    create_value_parser.add_argument(
+        '-v', '--value', type=float, required=True, nargs=1,
+        help='value to be set')
+    create_value_parser.set_defaults(func=create_value)
+
+    # "create newsflash" subcommand
+    create_newsflash_parser = create_subparsers.add_parser(
+        'newsflash', help='create a newsflash')
+    create_newsflash_parser.add_argument(
+        '-n', '--name', type=str, required=True, nargs=1,
+        help='name of newsflash')
+    create_newsflash_parser.add_argument(
+        '-i', '--icon-url', type=str, required=True, nargs=1,
+        help='url to svg icon for newsflash')
+    create_newsflash_parser.add_argument(
+        '-c', '--creator', type=str, nargs=1,
+        help='name of program that defined newsflash')
+    create_newsflash_parser.set_defaults(func=create_newsflash)
+
+    # "create event" subcommand
+    create_event_parser = create_subparsers.add_parser(
+        'event', help='create a newsflash event')
+    create_event_parser.add_argument(
+        '-n', '--newsflash', type=str, required=True, nargs=1,
+        help='name of newsflash')
+    create_event_parser.add_argument(
+        '-t', '--title', type=str, required=True, nargs=1,
+        help='title to display in hoopla')
+    create_event_parser.add_argument(
+        '-m', '--message', type=str, required=True, nargs=1,
+        help='message to display in hoopla')
+    create_event_parser.add_argument(
+        '-e', '--email', type=str, nargs=1,
+        help='email of user associated with event')
+    create_event_parser.add_argument(
+        '-r', '--recipients', type=str, nargs=1,
+        help='email address of users to be notified')
+    create_event_parser.set_defaults(func=create_event)
+
+    # "update newsflash" subcommand
+    update_newsflash_parser = update_subparsers.add_parser(
+        'newsflash', help='update a newsflash')
+    update_newsflash_parser.add_argument(
+        '--current-name', type=str, required=True, nargs=1,
+        help='current name of newsflash')
+    update_newsflash_parser.add_argument(
+        '-n', '--name', type=str, nargs=1,
+        help='new name of newsflash')
+    update_newsflash_parser.add_argument(
+        '-i', '--icon-url', type=str, nargs=1,
+        help='new url to svg icon for newsflash')
+    update_newsflash_parser.add_argument(
+        '-c', '--creator', type=str, nargs=1,
+        help='new name of program that defined newsflash')
+    update_newsflash_parser.set_defaults(func=update_newsflash)
+
+    # "update value" subcommand
+    update_value_parser = update_subparsers.add_parser(
+        'value', help='update a value')
+    update_value_parser.add_argument(
+        '-e', '--email', type=str, required=True, nargs=1,
+        help='email of user associated with value')
+    update_value_parser.add_argument(
+        '-m', '--metric', type=str, required=True, nargs=1,
+        help='name of metric')
+    update_value_parser.add_argument(
+        '-v', '--value', type=float, required=True, nargs=1,
+        help='new value to be set')
+    update_value_parser.set_defaults(func=update_value)
+
+    # "delete newsflash" subcommand
+    delete_newsflash_parser = delete_subparsers.add_parser(
+        'newsflash', help='delete a newsflash')
+    delete_newsflash_parser.add_argument(
+        '-n', '--name', type=str, required=True, nargs=1,
+        help='name of newsflash')
+    delete_newsflash_parser.set_defaults(func=delete_newsflash)
+
+    # "delete value" subcommand
+    delete_value_parser = delete_subparsers.add_parser(
+        'value', help='delete a value')
+    delete_value_parser.add_argument(
+        '-e', '--email', type=str, required=True, nargs=1,
+        help='email of user associated with value')
+    delete_value_parser.add_argument(
+        '-m', '--metric', type=str, required=True, nargs=1,
+        help='name of metric')
+    delete_value_parser.set_defaults(func=delete_value)
+
+    # parse the command line arguments
+    args = parser.parse_args()
+
+    # At this point, command line arguments seem valid. Anything
+    # beyond this point is a runtime error.
+
+    client_id = os.environ['CLIENT_ID']
+    if not client_id:
+        raise SystemExit("CLIENT_ID not set in environment.")
+
+    client_secret = os.environ['CLIENT_SECRET']
+    if not client_secret:
+        raise SystemExit("CLIENT_SECRET not set in environment.")
+
+    conn = Connection(client_id, client_secret, args.server)
+
+    # call function specified in subcommand above
+    args.func(args)
+    exit(0)
+
+if __name__ == '__main__':
+    main()
+
+# vim: tabstop=8 expandtab shiftwidth=4 softtabstop=4
