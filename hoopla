@@ -11,6 +11,7 @@ command line interface to the wrapper objects.
 from argparse import ArgumentParser
 import os
 import json
+import re
 from oauthlib.oauth2 import BackendApplicationClient
 from requests.exceptions import HTTPError
 from requests_oauthlib import OAuth2Session
@@ -56,6 +57,13 @@ class Base(object):
             if name == 'owner':
                 if isinstance(value, User):
                     value = {'kind': 'user', 'href': value.href}
+                elif isinstance(value, Team):
+                    value = {'kind': 'team', 'href': value.href}
+                elif isinstance(value, str):
+                    href = "urn:hoopla:generic:{0}".format(value)
+                    value = {'kind': 'generic', 'href': href}
+                else:
+                    raise Exception("Unknown type for 'owner' attribute.")
             self.api_attrs[name] = value
         else:
             self.__dict__[name] = value
@@ -187,11 +195,21 @@ class MetricValue(Base):
     def __getattr__(self, name):
         # return a User object if asked for the owner attribute
         if name == 'owner':
-            ownerdict = self.api_attrs['owner']
-            if ownerdict['kind'] == 'user':
-                owner = User({'href': ownerdict['href']}, self.client)
-                owner.reload()
-            return owner
+            owner = self.api_attrs['owner']
+            kind = owner['kind']
+            if kind == 'user':
+                user = User({'href': owner['href']}, self.client)
+                user.reload()
+                return user
+            elif kind == 'team':
+                team = Team({'href': owner['href']}, self.client)
+                team.reload()
+                return team
+            elif kind == 'generic':
+                match = re.match("urn:hoopla.generic:(.*)", owner['href'])
+                if match is None:
+                    raise "'owner.href' value is malformed"
+                return "{0} <generic>".format(match.group(1))
         else:
             return super(MetricValue, self).__getattr__(name)
 
@@ -208,6 +226,15 @@ class User(Base):
     def __str__(self):
         return("{0} {1} <{2}>".format(self.first_name, self.last_name,
                                       self.email))
+
+class Team(Base):
+    """Encapsulates attributes describing a team in Hoopla."""
+
+    def _api_attr_names(self):
+        return ['href', 'name']
+
+    def __str__(self):
+        return "{0} <team>".format(self.name)
 
 class Newsflash(Base):
     """Definition of a newsworthy event in Hoopla."""
@@ -286,6 +313,11 @@ class Connection(Base):
         params = {'email': email} if email else None
         return self._collection(User, 'list_users', params)
 
+    def teams(self, name=None):
+        """Return a list of Team objects."""
+        params = {'name': name} if name else None
+        return self._collection(Team, 'list_teams', params)
+
     def metrics(self):
         """Return a list of Metric objects."""
         return self._collection(Metric, 'list_metrics')
@@ -350,11 +382,41 @@ def main():
                 results.append(users[0])
         return results
 
+    def teams_by_names(names):
+        """Returns a list of team objects matching supplied names."""
+        results = []
+        for name in names:
+            # get Team object
+            teams = conn.teams(name)
+            if len(teams) < 1:
+                raise SystemExit(
+                    'No team found in Hoopla with name "{0}".'.format(name))
+            else:
+                results.append(teams[0])
+        return results
+
+    def get_owner_from_args(args):
+        """Verify that only one kind of owner was specified and return it."""
+
+        want = {'email', 'team', 'generic'}
+        options = dict((k, v) for k, v in vars(args).iteritems() if v and k in want)
+        if len(options) != 1:
+            raise SystemExit(
+                'Exactly one of -e/--email, -t/--team, or -g/--generic '
+                ' is required.')
+
+        if args.email:
+            return users_by_emails(args.email)[0]
+        elif args.team:
+            return teams_by_names(args.team)[0]
+        elif args.generic:
+            return args.generic[0]
+
     def create_value(args):
         """Create a Metric Value on the server."""
 
-        # get User object
-        users = users_by_emails(args.email)
+        # get owner object
+        owner = get_owner_from_args(args)
 
         # get Metric object
         metric = find_metric(args.metric[0])
@@ -364,7 +426,7 @@ def main():
 
         # assign attributes required for new resource
         metric_value.value = args.value[0]
-        metric_value.owner = users[0]
+        metric_value.owner = owner
 
         # save the new value on the service
         metric_value.save()
@@ -528,11 +590,17 @@ def main():
     create_value_parser = create_subparsers.add_parser(
         'value', help='create a metric value')
     create_value_parser.add_argument(
-        '-e', '--email', type=str, required=True, nargs=1,
+        '-e', '--email', type=str, required=False, nargs=1,
         help='email address of a user')
+    create_value_parser.add_argument(
+        '-g', '--generic', type=str, required=False, nargs=1,
+        help='generic identifier associated with value')
     create_value_parser.add_argument(
         '-m', '--metric', type=str, required=True, nargs=1,
         help='name of a metric')
+    create_value_parser.add_argument(
+        '-t', '--team', type=str, required=False, nargs=1,
+        help='team name associated with value')
     create_value_parser.add_argument(
         '-v', '--value', type=float, required=True, nargs=1,
         help='value to be set')
@@ -596,8 +664,14 @@ def main():
         '-e', '--email', type=str, required=True, nargs=1,
         help='email of user associated with value')
     update_value_parser.add_argument(
+        '-g', '--generic', type=str, required=True, nargs=1,
+        help='generic identifier associated with value')
+    update_value_parser.add_argument(
         '-m', '--metric', type=str, required=True, nargs=1,
         help='name of metric')
+    update_value_parser.add_argument(
+        '-t', '--team', type=str, required=True, nargs=1,
+        help='team name associated with value')
     update_value_parser.add_argument(
         '-v', '--value', type=float, required=True, nargs=1,
         help='new value to be set')
